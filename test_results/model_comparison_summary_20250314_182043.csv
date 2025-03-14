@@ -1,0 +1,2 @@
+model_name,model_type,parameters,dataset,accuracy,reasoning_length,inference_time,instruction_type,completion_rate,error_rate
+phi4:latest,Phi,4.2B,TruthfulQA MC1,67.5,18.75,1.7430348455905915,cod_instruction,100.0,0.0
