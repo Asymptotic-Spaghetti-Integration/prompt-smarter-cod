@@ -21,7 +21,7 @@ from ollama import AsyncClient
 # Example usage
 MODEL_NAMES = [
     'phi4:latest',
-    'gemma3:12b',
+    # 'gemma3:12b',
     'llama3.2:latest',
     'qwq:latest',
     'deepseek-r1:14b',
@@ -59,7 +59,7 @@ MODEL_METADATA = {
     'llama3.1:8b': {'model_type': 'Llama', 'parameters': '8B'}
 }
 
-async def evaluate_model_async(model_name, instruction_type, qa_models, sample_size=None, console=None, timeout=30):
+async def evaluate_model_async(model_name, instruction_type, qa_models, sample_size=None, console=None, timeout=120):
     """
     Async version of evaluate_model that uses streaming responses
     """
@@ -110,25 +110,35 @@ async def evaluate_model_async(model_name, instruction_type, qa_models, sample_s
                     options=qa_model.options
                 )
                 
-                start_time = time.time()
-                full_response = ""
-                token_count = 0
-                last_valid_json = None
-                
                 try:
-                    # Collect the entire response first
-                    async for part in await asyncio.wait_for(
-                        client.chat(
-                            messages=[{
-                                'role': 'user',
-                                'content': prompt,
-                            }],
-                            model=model_name,
-                            format=Answer.model_json_schema(),
-                            stream=True
-                        ),
-                        timeout=timeout
-                    ):
+                    # Start the stream but don't wait for it to complete
+                    stream = client.chat(
+                        messages=[{
+                            'role': 'user',
+                            'content': prompt,
+                        }],
+                        model=model_name,
+                        options={"temperature": 0},
+                        format=Answer.model_json_schema(),
+                        stream=True
+                    )
+                    
+                    # Get the initial response (this starts the stream)
+                    stream_iterator = await asyncio.wait_for(stream, timeout=timeout)
+                    
+                    start_time = time.time()
+                    full_response = ""
+                    token_count = 0
+                    last_valid_json = None
+                    
+                    # Set a timeout for the entire streaming process
+                    stream_timeout = start_time + timeout
+                    
+                    async for part in stream_iterator:
+                        # Check if we've exceeded our timeout
+                        if time.time() > stream_timeout:
+                            raise asyncio.TimeoutError(f"Streaming process exceeded timeout of {timeout}s")
+                            
                         chunk = part['message']['content']
                         full_response += chunk
                         token_count += 1
@@ -280,7 +290,7 @@ async def evaluate_model_async(model_name, instruction_type, qa_models, sample_s
     
     return evaluation_results
 
-def evaluate_model(model_name, instruction_type, qa_models, sample_size=None, console=None, timeout=30):
+def evaluate_model(model_name, instruction_type, qa_models, sample_size=None, console=None, timeout=120):
     """
     Synchronous wrapper for evaluate_model_async
     """
@@ -317,7 +327,72 @@ def save_results(all_results, output_dir="results"):
             summary = {col: result.get(col) for col in COMPARISON_TABLE_COLUMNS}
             writer.writerow(summary)
     
-    return json_path, csv_path
+    # Save detailed question-by-question results
+    question_results = {}
+    
+    # Collect all questions and answers across models
+    for result in all_results:
+        model_name = result["model_name"]
+        instruction_type = result["instruction_type"]
+        model_key = f"{model_name}_{instruction_type}"
+        
+        for detail in result.get("detailed_results", []):
+            question = detail.get("question")
+            if not question:
+                continue
+                
+            if question not in question_results:
+                question_results[question] = {
+                    "question": question,
+                    "correct_answer": detail.get("correct_answer"),
+                    "model_answers": {},
+                    "correct_count": 0,
+                    "total_attempts": 0
+                }
+            
+            # Add this model's answer
+            question_results[question]["model_answers"][model_key] = {
+                "answer": detail.get("model_answer"),
+                "is_correct": detail.get("is_correct", False),
+                "reasoning": detail.get("reasoning", ""),
+                "inference_time": detail.get("inference_time", 0),
+                "error": detail.get("error")
+            }
+            
+            # Update counts
+            if detail.get("is_correct", False):
+                question_results[question]["correct_count"] += 1
+            if not detail.get("error"):
+                question_results[question]["total_attempts"] += 1
+    
+    # Calculate accuracy per question
+    for question_data in question_results.values():
+        attempts = question_data["total_attempts"]
+        if attempts > 0:
+            question_data["accuracy"] = (question_data["correct_count"] / attempts) * 100
+        else:
+            question_data["accuracy"] = 0
+    
+    # Sort questions by accuracy (ascending to show most difficult first)
+    sorted_questions = sorted(question_results.values(), key=lambda x: x["accuracy"])
+    
+    # Save detailed question results
+    questions_path = os.path.join(output_dir, f"question_analysis_{timestamp}.json")
+    with open(questions_path, 'w') as f:
+        json.dump(sorted_questions, f, indent=2)
+    
+    # Save a CSV with the most difficult questions
+    difficult_questions_path = os.path.join(output_dir, f"difficult_questions_{timestamp}.csv")
+    with open(difficult_questions_path, 'w', newline='') as f:
+        fieldnames = ["question", "correct_answer", "accuracy", "correct_count", "total_attempts"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for question_data in sorted_questions:
+            row = {field: question_data[field] for field in fieldnames}
+            writer.writerow(row)
+    
+    return json_path, csv_path, questions_path, difficult_questions_path
 
 def display_summary_table(all_results, console):
     """Display a summary table of all results"""
@@ -417,9 +492,71 @@ def display_instruction_comparison(all_results, console):
         console.print(table)
         console.print()  # Add some space between tables
 
+def display_difficult_questions(all_results, console, top_n=5):
+    """Display the most difficult questions across all models"""
+    # Collect question results
+    question_results = {}
+    
+    # Process all detailed results
+    for result in all_results:
+        for detail in result.get("detailed_results", []):
+            question = detail.get("question")
+            if not question or detail.get("error"):
+                continue
+                
+            if question not in question_results:
+                question_results[question] = {
+                    "question": question,
+                    "correct_answer": detail.get("correct_answer"),
+                    "correct_count": 0,
+                    "total_attempts": 0
+                }
+            
+            # Update counts
+            if detail.get("is_correct", False):
+                question_results[question]["correct_count"] += 1
+            question_results[question]["total_attempts"] += 1
+    
+    # Calculate accuracy per question
+    for question_data in question_results.values():
+        attempts = question_data["total_attempts"]
+        if attempts > 0:
+            question_data["accuracy"] = (question_data["correct_count"] / attempts) * 100
+        else:
+            question_data["accuracy"] = 0
+    
+    # Sort questions by accuracy (ascending)
+    sorted_questions = sorted(
+        question_results.values(), 
+        key=lambda x: x["accuracy"]
+    )
+    
+    # Display the most difficult questions
+    if sorted_questions:
+        console.print("\n[bold]Most Difficult Questions:[/bold]")
+        
+        table = Table(box=box.ROUNDED)
+        table.add_column("Question", style="cyan", no_wrap=False)
+        table.add_column("Correct Answer", style="green")
+        table.add_column("Accuracy", style="yellow")
+        table.add_column("Correct/Total", style="magenta")
+        
+        for i, q in enumerate(sorted_questions[:top_n]):
+            table.add_row(
+                q["question"],
+                q["correct_answer"],
+                f"{q['accuracy']:.1f}%",
+                f"{q['correct_count']}/{q['total_attempts']}"
+            )
+        
+        console.print(table)
+
 def main():
     # Initialize rich console for nice formatting
     console = Console()
+    
+    # Start timing the full run
+    start_time = time.time()
     
     # Load the processed data
     qa_models = load_qa_data()
@@ -465,9 +602,17 @@ def main():
     except (ValueError, IndexError):
         console.print("[red]Invalid input, using all instruction types[/red]")
     
+    # Take the first N questions instead of random sampling
+    if sample_size and sample_size < len(qa_models):
+        evaluation_subset = qa_models[:sample_size]
+    else:
+        evaluation_subset = qa_models
+    
+    # Update dataset_size to reflect the actual subset size
+    dataset_size = len(evaluation_subset)
+    
     # Confirm evaluation plan
     total_evaluations = len(selected_models) * len(selected_instructions)
-    dataset_size = sample_size if sample_size > 0 else len(qa_models)
     
     console.print(Panel(f"""
 [bold green]Evaluation Plan:[/bold green]
@@ -485,23 +630,29 @@ def main():
     
     # Run evaluations
     all_results = []
+    evaluation_start_time = time.time()
     
     for model_name in selected_models:
         for instruction_type in selected_instructions:
+            model_start_time = time.time()
             console.print(f"\n[bold]Evaluating {model_name} with {instruction_type}...[/bold]")
             
             result = evaluate_model(
                 model_name=model_name,
                 instruction_type=instruction_type,
-                qa_models=qa_models,
-                sample_size=sample_size,
+                qa_models=evaluation_subset,  # Use the same subset for all evaluations
+                sample_size=None,  # Don't sample again, we're passing the subset directly
                 console=console
             )
             
             all_results.append(result)
             
+            model_elapsed_time = time.time() - model_start_time
             # Show quick result
             console.print(f"[green]Accuracy: {result['accuracy']:.2f}%[/green]")
+            console.print(f"[blue]Time taken: {model_elapsed_time:.2f} seconds[/blue]")
+    
+    evaluation_elapsed_time = time.time() - evaluation_start_time
     
     # Display results
     console.print("\n[bold green]Evaluation Complete![/bold green]\n")
@@ -514,26 +665,47 @@ def main():
     console.print()
     
     display_instruction_comparison(all_results, console)
+    console.print()
+    
+    # Display most difficult questions
+    display_difficult_questions(all_results, console)
     
     # Save results to files
-    json_path, csv_path = save_results(all_results)
+    json_path, csv_path, questions_path, difficult_questions_path = save_results(all_results)
     console.print(f"\n[bold]Results saved to:[/bold]")
-    console.print(f"• JSON: {json_path}")
-    console.print(f"• CSV: {csv_path}")
+    console.print(f"• Summary JSON: {json_path}")
+    console.print(f"• Summary CSV: {csv_path}")
+    console.print(f"• Question Analysis: {questions_path}")
+    console.print(f"• Difficult Questions: {difficult_questions_path}")
+    
+    # Display total time taken
+    total_elapsed_time = time.time() - start_time
+    console.print(Panel(f"""
+[bold cyan]Time Summary:[/bold cyan]
+• Evaluation time: {evaluation_elapsed_time:.2f} seconds ({evaluation_elapsed_time/60:.2f} minutes)
+• Total run time: {total_elapsed_time:.2f} seconds ({total_elapsed_time/60:.2f} minutes)
+• Average time per evaluation: {evaluation_elapsed_time/total_evaluations:.2f} seconds
+    """))
 
 def test_run():
     """Run a quick test evaluation using 1% of the dataset for all models and instructions"""
     console = Console()
     
+    # Start timing the test run
+    start_time = time.time()
+    
     # Load the processed data
     qa_models = load_qa_data()
     
-    # Calculate 1% sample size
-    sample_size = max(int(len(qa_models) * 0.01), 1)  # At least 1 question
+    # Calculate sample size
+    sample_size = max(int(len(qa_models) * 0.05), 1)  # At least 1 question
+    
+    # Take the first N questions instead of random sampling
+    evaluation_subset = qa_models[:sample_size]
     
     console.print(Panel(f"""
 [bold yellow]Test Run Configuration[/bold yellow]
-• Using {sample_size} questions ({(sample_size/len(qa_models)*100):.1f}% of dataset)
+• Using {len(evaluation_subset)} questions ({(len(evaluation_subset)/len(qa_models)*100):.1f}% of dataset)
 • Testing all {len(MODEL_NAMES)} models
 • Testing all {len(INSTRUCTIONS)} instruction types
 • Total evaluations: {len(MODEL_NAMES) * len(INSTRUCTIONS)}
@@ -543,23 +715,29 @@ def test_run():
     console.print(f"\n[bold]Starting test evaluation...[/bold]")
     
     all_results = []
+    evaluation_start_time = time.time()
     
     for model_name in MODEL_NAMES:
         for instruction_type in INSTRUCTIONS:
+            model_start_time = time.time()
             console.print(f"\n[bold]Evaluating {model_name} with {instruction_type}...[/bold]")
             
             result = evaluate_model(
                 model_name=model_name,
                 instruction_type=instruction_type,
-                qa_models=qa_models,
-                sample_size=sample_size,
+                qa_models=evaluation_subset,  # Use the same subset for all evaluations
+                sample_size=None,  # Don't sample again, we're passing the subset directly
                 console=console
             )
             
             all_results.append(result)
             
+            model_elapsed_time = time.time() - model_start_time
             # Show quick result
             console.print(f"[green]Accuracy: {result['accuracy']:.2f}%[/green]")
+            console.print(f"[blue]Time taken: {model_elapsed_time:.2f} seconds[/blue]")
+    
+    evaluation_elapsed_time = time.time() - evaluation_start_time
     
     # Display results
     console.print("\n[bold green]Test Run Complete![/bold green]\n")
@@ -572,12 +750,28 @@ def test_run():
     console.print()
     
     display_instruction_comparison(all_results, console)
+    console.print()
+    
+    # Display most difficult questions
+    display_difficult_questions(all_results, console)
     
     # Save test results
-    json_path, csv_path = save_results(all_results, output_dir="test_results")
+    json_path, csv_path, questions_path, difficult_questions_path = save_results(all_results, output_dir="test_results")
     console.print(f"\n[bold]Test results saved to:[/bold]")
-    console.print(f"• JSON: {json_path}")
-    console.print(f"• CSV: {csv_path}")
+    console.print(f"• Summary JSON: {json_path}")
+    console.print(f"• Summary CSV: {csv_path}")
+    console.print(f"• Question Analysis: {questions_path}")
+    console.print(f"• Difficult Questions: {difficult_questions_path}")
+    
+    # Display total time taken
+    total_elapsed_time = time.time() - start_time
+    console.print(Panel(f"""
+[bold cyan]Time Summary:[/bold cyan]
+• Evaluation time: {evaluation_elapsed_time:.2f} seconds ({evaluation_elapsed_time/60:.2f} minutes)
+• Total run time: {total_elapsed_time:.2f} seconds ({total_elapsed_time/60:.2f} minutes)
+• Average time per evaluation: {evaluation_elapsed_time/(len(MODEL_NAMES) * len(INSTRUCTIONS)):.2f} seconds
+• Estimated full dataset time: {evaluation_elapsed_time * (len(qa_models)/sample_size):.2f} seconds ({evaluation_elapsed_time * (len(qa_models)/sample_size)/60:.2f} minutes)
+    """))
 
 if __name__ == "__main__":
     # Run the test by default
