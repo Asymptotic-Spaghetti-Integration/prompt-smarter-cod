@@ -37,4 +37,6 @@ class AnswerChoice(str, Enum):
 class Answer(BaseModel):
     answer: AnswerChoice
     reasoning: Optional[str] = None
+    
+    
 

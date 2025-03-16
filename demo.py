@@ -774,9 +774,25 @@ def test_run():
     """))
 
 if __name__ == "__main__":
-    # Run the test by default
-    test_run()
+    console = Console()
+    console.print(Panel("[bold cyan]Model Evaluation Tool[/bold cyan]"))
+    console.print("This tool evaluates multiple LLMs on the TruthfulQA dataset.")
     
-    # Ask if user wants to run full evaluation
-    if input("\nRun full evaluation with complete dataset? (y/n): ").lower().strip() == 'y':
+    # Ask user what they want to run
+    console.print("\n[bold]Choose an option:[/bold]")
+    console.print("1. Run quick test (5% of dataset)")
+    console.print("2. Run full evaluation")
+    console.print("3. Run test first, then full evaluation")
+    
+    choice = input("\nEnter your choice (1-3): ").strip()
+    
+    if choice == '1':
+        test_run()
+    elif choice == '2':
         main()
+    elif choice == '3':
+        test_run()
+        if input("\nContinue with full evaluation? (y/n): ").lower().strip() == 'y':
+            main()
+    else:
+        console.print("[red]Invalid choice. Exiting.[/red]")
